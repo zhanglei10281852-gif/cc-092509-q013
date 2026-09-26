@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class LocationCreate(BaseModel):
@@ -29,6 +30,18 @@ class DossierCreate(BaseModel):
     quantity: float = Field(gt=0)
     unit: str = Field(min_length=1, max_length=20)
     vault_id: int | None = Field(default=None, gt=0)
+    secrecy_level: Literal["internal", "confidential", "restricted", "top_secret"] = "internal"
+    retention_until: str | None = Field(default=None, min_length=8, max_length=40)
+
+    @field_validator("retention_until")
+    @classmethod
+    def check_retention_until(cls, value: str | None) -> str | None:
+        if value is not None:
+            try:
+                datetime.fromisoformat(value)
+            except ValueError as exc:
+                raise ValueError("保存期限必须是 ISO-8601 日期或时间") from exc
+        return value
 
 
 class CopyIssueChild(BaseModel):

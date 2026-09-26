@@ -131,6 +131,8 @@ class DossierLifecycleService:
                     "vault_id": item.get("vault_id", parent["vault_id"]),
                     "custody_user_id": principal.user_id,
                     "provenance_depth": parent["provenance_depth"] + 1,
+                    "secrecy_level": parent["secrecy_level"],
+                    "retention_until": parent["retention_until"],
                 },
                 now,
             )

@@ -190,6 +190,8 @@ CREATE TABLE IF NOT EXISTS dossiers (
     vault_id INTEGER REFERENCES vault_locations(id),
     custody_user_id INTEGER REFERENCES users(id),
     provenance_depth INTEGER NOT NULL DEFAULT 0,
+    secrecy_level TEXT NOT NULL DEFAULT 'internal' CHECK(secrecy_level IN ('internal','confidential','restricted','top_secret')),
+    retention_until TEXT,
     version INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -335,6 +337,74 @@ CREATE TABLE IF NOT EXISTS dossier_events (
     occurred_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_dossier_events_dossier ON dossier_events(dossier_id, id);
+
+CREATE TABLE IF NOT EXISTS legal_holds (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    hold_code TEXT NOT NULL UNIQUE,
+    matter_reference TEXT NOT NULL,
+    notice_type TEXT NOT NULL CHECK(notice_type IN ('litigation','regulatory_investigation')),
+    reason TEXT NOT NULL,
+    scope_type TEXT NOT NULL CHECK(scope_type IN ('project','family','incident')),
+    scope_key TEXT NOT NULL,
+    review_until TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','released')),
+    created_by INTEGER NOT NULL REFERENCES users(id),
+    created_at TEXT NOT NULL,
+    released_by INTEGER REFERENCES users(id),
+    released_at TEXT,
+    release_reason TEXT,
+    version INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS idx_legal_holds_scope ON legal_holds(scope_type, scope_key);
+
+CREATE TABLE IF NOT EXISTS legal_hold_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    hold_id INTEGER NOT NULL REFERENCES legal_holds(id) ON DELETE CASCADE,
+    dossier_id INTEGER NOT NULL REFERENCES dossiers(id),
+    attached_at TEXT NOT NULL,
+    released_at TEXT,
+    UNIQUE(hold_id, dossier_id)
+);
+CREATE INDEX IF NOT EXISTS idx_legal_hold_items_dossier ON legal_hold_items(dossier_id);
+
+CREATE TABLE IF NOT EXISTS legal_hold_extensions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    hold_id INTEGER NOT NULL REFERENCES legal_holds(id) ON DELETE CASCADE,
+    previous_review_until TEXT NOT NULL,
+    new_review_until TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    extended_by INTEGER NOT NULL REFERENCES users(id),
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS disposal_plans (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    plan_code TEXT NOT NULL UNIQUE,
+    dossier_id INTEGER NOT NULL REFERENCES dossiers(id),
+    approval_request_id INTEGER NOT NULL REFERENCES approval_requests(id),
+    eligibility_json TEXT NOT NULL,
+    eligibility_digest TEXT NOT NULL,
+    dossier_version INTEGER NOT NULL,
+    state TEXT NOT NULL DEFAULT 'ready' CHECK(state IN ('ready','paused','executing','executed','cancelled')),
+    pause_reason TEXT,
+    disposal_record_id INTEGER REFERENCES disposal_records(id),
+    created_by INTEGER NOT NULL REFERENCES users(id),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    version INTEGER NOT NULL DEFAULT 1
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_disposal_plans_active
+    ON disposal_plans(dossier_id) WHERE state IN ('ready','paused','executing');
+
+CREATE TABLE IF NOT EXISTS disposal_plan_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    plan_id INTEGER NOT NULL REFERENCES disposal_plans(id) ON DELETE CASCADE,
+    event_type TEXT NOT NULL,
+    actor_user_id INTEGER REFERENCES users(id),
+    details_json TEXT NOT NULL DEFAULT '{}',
+    occurred_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_disposal_plan_events_plan ON disposal_plan_events(plan_id, id);
 """
 
 PERMISSIONS = [
@@ -353,6 +423,7 @@ PERMISSIONS = [
     ("approvals.decide", "审批高风险操作", "approvals", "decide"),
     ("vaults.read_sensitive", "查看精确密级库位", "vaults", "read_sensitive"),
     ("incidents.manage", "管理泄密事件", "incidents", "manage"),
+    ("legal_holds.manage", "管理法律保全", "legal_holds", "manage"),
 ]
 
 
@@ -401,10 +472,23 @@ def transaction(*, immediate: bool = False) -> Iterator[sqlite3.Connection]:
         connection.commit()
 
 
+def _ensure_dossier_columns(connection: sqlite3.Connection) -> None:
+    """为既有数据库补齐档案密级与保存期限列。"""
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(dossiers)")}
+    if "secrecy_level" not in columns:
+        connection.execute(
+            "ALTER TABLE dossiers ADD COLUMN secrecy_level TEXT NOT NULL DEFAULT 'internal' "
+            "CHECK(secrecy_level IN ('internal','confidential','restricted','top_secret'))"
+        )
+    if "retention_until" not in columns:
+        connection.execute("ALTER TABLE dossiers ADD COLUMN retention_until TEXT")
+
+
 def init_db() -> None:
     now = to_storage(utc_now())
     connection = get_connection()
     connection.executescript(SCHEMA)
+    _ensure_dossier_columns(connection)
     with transaction(immediate=True) as connection:
         for code, name, resource, action in PERMISSIONS:
             connection.execute(
@@ -417,6 +501,7 @@ def init_db() -> None:
             ("researcher", "研究人员", "查看档案并申请查阅借阅或登记对外合作披露使用"),
             ("approver", "风险审批人", "复核合规处置、位置解密与载体盘点调整"),
             ("auditor", "审计查看员", "只读查看档案事件和审计记录"),
+            ("legal_officer", "法务专员", "设置与解除法律保全，跟踪保存期限到期评估"),
         )
         for code, name, description in roles:
             connection.execute(
@@ -436,6 +521,7 @@ def init_db() -> None:
             "researcher": ["dossiers.read", "dossiers.disclose"],
             "approver": ["dossiers.read", "approvals.decide"],
             "auditor": ["dossiers.read", "audit.read"],
+            "legal_officer": ["dossiers.read", "legal_holds.manage"],
         }
         for role_code, permission_codes in role_permissions.items():
             role_id = connection.execute("SELECT id FROM roles WHERE code=?", (role_code,)).fetchone()[0]

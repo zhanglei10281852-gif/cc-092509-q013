@@ -13,6 +13,32 @@ from app.archives.repository import ApprovalRepository, VaultRepository, Dossier
 from app.services.audit import AuditService
 
 
+def disposal_certificate_digest(
+    *,
+    request_id: int,
+    dossier_id: int,
+    quantity: float,
+    method: str,
+    witness_one: int,
+    witness_two: int,
+    disposed_at: str,
+) -> str:
+    """合规处置证明摘要，供执行写入与事后核对共用。"""
+    canonical = json.dumps(
+        {
+            "request_id": request_id,
+            "dossier_id": dossier_id,
+            "quantity": quantity,
+            "method": method,
+            "witnesses": sorted([witness_one, witness_two]),
+            "disposed_at": disposed_at,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 class DisclosureService:
     def __init__(self, connection: sqlite3.Connection, clock: Clock | None = None):
         self.connection = connection
@@ -141,6 +167,14 @@ class DisposalService:
         if existing:
             return {"record": dict(existing), "dossier": self.dossiers.get(approval["resource_id"]), "replayed": True}
         dossier = self.dossiers.get(approval["resource_id"])
+        held = self.connection.execute(
+            """SELECT h.hold_code FROM legal_hold_items i
+               JOIN legal_holds h ON h.id=i.hold_id
+               WHERE i.dossier_id=? AND h.status='active' AND i.released_at IS NULL LIMIT 1""",
+            (dossier["id"],),
+        ).fetchone()
+        if held:
+            raise ConflictError("档案处于法律保全状态，禁止合规处置", context={"hold_code": held["hold_code"]})
         quantity = float(approval["payload"].get("quantity", dossier["quantity"]))
         if quantity <= 0 or quantity > dossier["quantity"] - dossier["reserved_quantity"]:
             raise ConflictError("审批数量超过当前可合规处置数量")
@@ -149,20 +183,15 @@ class DisposalService:
         updated = self.dossiers.change_quantity(dossier["id"], -quantity, dossier["version"], now)
         target_state = "disposed" if remaining == 0 else "partially_disclosed"
         updated = self.dossiers.set_state(dossier["id"], target_state, updated["version"], now)
-        certificate = hashlib.sha256(
-            json.dumps(
-                {
-                    "request_id": request_id,
-                    "dossier_id": dossier["id"],
-                    "quantity": quantity,
-                    "method": data["method"],
-                    "witnesses": sorted([data["witness_one"], data["witness_two"]]),
-                    "disposed_at": now,
-                },
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("utf-8")
-        ).hexdigest()
+        certificate = disposal_certificate_digest(
+            request_id=request_id,
+            dossier_id=dossier["id"],
+            quantity=quantity,
+            method=data["method"],
+            witness_one=data["witness_one"],
+            witness_two=data["witness_two"],
+            disposed_at=now,
+        )
         cursor = self.connection.execute(
             """INSERT INTO disposal_records(
                    dossier_id,request_id,method,witness_one,witness_two,disposed_quantity,
