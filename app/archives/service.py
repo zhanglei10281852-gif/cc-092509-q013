@@ -10,8 +10,8 @@ from typing import Any
 from app.core.clock import Clock, SystemClock, to_storage
 from app.core.errors import ConflictError, NotFoundError, ValidationError
 from app.core.security import Principal
-from app.archives.repository import IncidentRepository, ApprovalRepository, IntakeRepository, VaultRepository, DossierRepository
-from app.archives.validation import require_code
+from app.archives.repository import IncidentRepository, ApprovalRepository, IntakeRepository, VaultRepository, DossierRepository, auto_pause_plans
+from app.archives.validation import require_code, require_iso_moment
 from app.services.audit import AuditService
 
 
@@ -71,6 +71,8 @@ class DossierLifecycleService:
     def register_dossier(self, principal: Principal, data: dict[str, Any]) -> dict[str, Any]:
         principal.require("dossiers.write")
         data = {**data, "dossier_code": require_code(data["dossier_code"], "档案编码")}
+        if data.get("retention_until"):
+            data["retention_until"] = require_iso_moment(data["retention_until"], "保存期限")
         if self.dossiers.by_code(data["dossier_code"]):
             raise ConflictError("档案编码已经存在")
         self.batches.get(data["intake_id"])
@@ -143,6 +145,14 @@ class DossierLifecycleService:
             (operation_code, dossier_id, data["requested_quantity"], sum(item["quantity"] for item in data["children"]), data.get("loss_quantity", 0), principal.user_id, now, data.get("note", ""), now),
         )
         self.dossiers.append_event(dossier_id, "issue_copy.source", principal.user_id, now, quantity_delta=-data["requested_quantity"], details={"operation_code": operation_code, "child_ids": [item["id"] for item in children]})
+        auto_pause_plans(
+            self.connection,
+            dossier_id,
+            "dossier_version_changed",
+            now,
+            actor_user_id=principal.user_id,
+            details={"trigger": "issue_copy.source"},
+        )
         self.audit.record(principal, "dossier.issue_copy", "dossier", str(dossier_id), before=parent, after=updated_parent, metadata={"operation_code": operation_code})
         return {"operation_code": operation_code, "parent": updated_parent, "children": children}
 
@@ -170,6 +180,14 @@ class DossierLifecycleService:
         )
         record = dict(self.connection.execute("SELECT * FROM disclosure_use_records WHERE id=?", (cursor.lastrowid,)).fetchone())
         self.dossiers.append_event(dossier_id, "disclosed", principal.user_id, now, quantity_delta=-data["quantity"], from_state=dossier["lifecycle_state"], to_state=new_state, details={"recipient_code": data["recipient_code"]})
+        auto_pause_plans(
+            self.connection,
+            dossier_id,
+            "dossier_version_changed",
+            now,
+            actor_user_id=principal.user_id,
+            details={"trigger": "disclosed"},
+        )
         self.audit.record(principal, "dossier.disclose", "dossier", str(dossier_id), before=dossier, after=updated)
         return {"record": record, "dossier": updated, "replayed": False}
 
@@ -201,6 +219,14 @@ class AccessLoanService:
         )
         access_loan = dict(self.connection.execute("SELECT * FROM access_loans WHERE id=?", (cursor.lastrowid,)).fetchone())
         self.dossiers.append_event(data["dossier_id"], "access_loaned", principal.user_id, now, from_state=dossier["lifecycle_state"], to_state="access_loaned", details={"access_loan_id": access_loan["id"], "requester_user_id": data["requester_user_id"]})
+        auto_pause_plans(
+            self.connection,
+            data["dossier_id"],
+            "dossier_version_changed",
+            now,
+            actor_user_id=principal.user_id,
+            details={"trigger": "access_loaned"},
+        )
         self.audit.record(principal, "access_loan.create", "access_loan", str(access_loan["id"]), after=access_loan)
         return access_loan
 
@@ -230,6 +256,14 @@ class AccessLoanService:
         )
         result = dict(self.connection.execute("SELECT * FROM access_loans WHERE id=?", (access_loan_id,)).fetchone())
         self.dossiers.append_event(access_loan["dossier_id"], "returned", principal.user_id, now, quantity_delta=0, details={"access_loan_id": access_loan_id, "returned_quantity": data["quantity"]})
+        auto_pause_plans(
+            self.connection,
+            access_loan["dossier_id"],
+            "dossier_version_changed",
+            now,
+            actor_user_id=principal.user_id,
+            details={"trigger": "returned"},
+        )
         self.audit.record(principal, "access_loan.return", "access_loan", str(access_loan_id), before=access_loan, after=result)
         return result
 

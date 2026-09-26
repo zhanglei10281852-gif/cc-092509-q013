@@ -13,6 +13,39 @@ def row_dict(row: sqlite3.Row | None) -> dict[str, Any]:
     return dict(row)
 
 
+def auto_pause_plans(
+    connection: sqlite3.Connection,
+    dossier_id: int,
+    reason: str,
+    now: str,
+    *,
+    actor_user_id: int | None = None,
+    details: dict[str, Any] | None = None,
+) -> list[int]:
+    """档案版本变化等事件发生时，自动暂停该档案全部待执行处置计划。
+
+    历史决定只追加事件、不覆盖；已暂停或已执行的计划不会被重复暂停。
+    """
+    plan_ids = [
+        row[0]
+        for row in connection.execute(
+            "SELECT id FROM disposal_plans WHERE dossier_id=? AND state='scheduled' ORDER BY id",
+            (dossier_id,),
+        ).fetchall()
+    ]
+    for plan_id in plan_ids:
+        connection.execute(
+            "UPDATE disposal_plans SET state='paused',pause_reason=?,version=version+1,updated_at=? WHERE id=?",
+            (reason, now, plan_id),
+        )
+        connection.execute(
+            """INSERT INTO disposal_plan_events(plan_id,event_type,from_state,to_state,actor_user_id,details_json,occurred_at)
+               VALUES(?,?, 'scheduled','paused',?,?,?)""",
+            (plan_id, "paused", actor_user_id, json.dumps({"reason": reason, **(details or {})}, ensure_ascii=False), now),
+        )
+    return plan_ids
+
+
 class VaultRepository:
     def __init__(self, connection: sqlite3.Connection):
         self.connection = connection
@@ -107,12 +140,13 @@ class DossierRepository:
     def create(self, data: dict[str, Any], now: str) -> dict[str, Any]:
         cursor = self.connection.execute(
             """INSERT INTO dossiers(dossier_code,intake_id,disclosure_event_id,source_dossier_id,root_dossier_id,asset_type,
-               quantity,unit,lifecycle_state,vault_id,custody_user_id,provenance_depth,created_at,updated_at)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               quantity,unit,lifecycle_state,vault_id,custody_user_id,provenance_depth,secrecy_level,retention_until,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 data["dossier_code"], data["intake_id"], data.get("disclosure_event_id"), data.get("source_dossier_id"),
                 data.get("root_dossier_id"), data["asset_type"], data["quantity"], data["unit"], data["lifecycle_state"],
-                data.get("vault_id"), data.get("custody_user_id"), data.get("provenance_depth", 0), now, now,
+                data.get("vault_id"), data.get("custody_user_id"), data.get("provenance_depth", 0),
+                data.get("secrecy_level", "internal"), data.get("retention_until"), now, now,
             ),
         )
         dossier_id = cursor.lastrowid
@@ -206,6 +240,113 @@ class ApprovalRepository:
             (state, now, request_id),
         )
         return self.get(request_id)
+
+
+class LegalHoldRepository:
+    """法律保全的持久化与覆盖范围查询，供保全服务与处置服务共用。"""
+
+    def __init__(self, connection: sqlite3.Connection):
+        self.connection = connection
+
+    def by_code(self, hold_code: str) -> dict[str, Any] | None:
+        row = self.connection.execute("SELECT * FROM legal_holds WHERE hold_code=?", (hold_code,)).fetchone()
+        return dict(row) if row else None
+
+    def get(self, hold_id: int) -> dict[str, Any]:
+        return row_dict(self.connection.execute("SELECT * FROM legal_holds WHERE id=?", (hold_id,)).fetchone())
+
+    def create(self, data: dict[str, Any], created_by: int, now: str) -> dict[str, Any]:
+        cursor = self.connection.execute(
+            """INSERT INTO legal_holds(hold_code,scope_type,scope_key,source_type,source_reference,reason,
+               state,review_by,created_by,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,'active',?,?,?,?)""",
+            (
+                data["hold_code"], data["scope_type"], data["scope_key"], data["source_type"],
+                data["source_reference"], data["reason"], data["review_by"], created_by, now, now,
+            ),
+        )
+        return self.get(cursor.lastrowid)
+
+    def list(self, state: str | None = None, scope_type: str | None = None) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if state:
+            clauses.append("state=?")
+            params.append(state)
+        if scope_type:
+            clauses.append("scope_type=?")
+            params.append(scope_type)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        params.append(500)
+        rows = self.connection.execute(
+            "SELECT * FROM legal_holds" + where + " ORDER BY id DESC LIMIT ?", tuple(params)
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def attach_items(self, hold_id: int, dossier_ids: list[int], now: str) -> None:
+        for dossier_id in dossier_ids:
+            self.connection.execute(
+                "INSERT OR IGNORE INTO legal_hold_items(hold_id,dossier_id,attached_at) VALUES(?,?,?)",
+                (hold_id, dossier_id, now),
+            )
+
+    def items(self, hold_id: int) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            """SELECT i.*,s.dossier_code,s.lifecycle_state,s.secrecy_level
+               FROM legal_hold_items i JOIN dossiers s ON s.id=i.dossier_id
+               WHERE i.hold_id=? ORDER BY s.dossier_code""",
+            (hold_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def extensions(self, hold_id: int) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            "SELECT * FROM legal_hold_extensions WHERE hold_id=? ORDER BY id", (hold_id,)
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def events(self, hold_id: int) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            "SELECT * FROM legal_hold_events WHERE hold_id=? ORDER BY id", (hold_id,)
+        ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["details"] = json.loads(item.pop("details_json"))
+            result.append(item)
+        return result
+
+    def append_event(self, hold_id: int, event_type: str, actor_user_id: int | None, now: str, details: dict[str, Any] | None = None) -> None:
+        self.connection.execute(
+            "INSERT INTO legal_hold_events(hold_id,event_type,actor_user_id,details_json,occurred_at) VALUES(?,?,?,?,?)",
+            (hold_id, event_type, actor_user_id, json.dumps(details or {}, ensure_ascii=False), now),
+        )
+
+    def active_for_dossier(self, dossier_id: int) -> list[dict[str, Any]]:
+        """返回当前覆盖指定档案的全部生效保全（含冻结来源与范围）。"""
+        rows = self.connection.execute(
+            """SELECT h.* FROM legal_holds h
+               JOIN legal_hold_items i ON i.hold_id=h.id
+               WHERE i.dossier_id=? AND h.state='active' ORDER BY h.id""",
+            (dossier_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def active_hold_ids_for(self, dossier_ids: list[int]) -> dict[int, list[int]]:
+        """批量返回 dossier_id -> 生效保全 id 列表，用于范围解析时避免重复冻结。"""
+        if not dossier_ids:
+            return {}
+        placeholders = ",".join("?" for _ in dossier_ids)
+        rows = self.connection.execute(
+            f"""SELECT i.dossier_id,h.id FROM legal_hold_items i
+                JOIN legal_holds h ON h.id=i.hold_id
+                WHERE h.state='active' AND i.dossier_id IN ({placeholders})""",
+            tuple(dossier_ids),
+        ).fetchall()
+        result: dict[int, list[int]] = {}
+        for row in rows:
+            result.setdefault(row[0], []).append(row[1])
+        return result
 
 
 class IncidentRepository:

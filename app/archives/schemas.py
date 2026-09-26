@@ -29,6 +29,8 @@ class DossierCreate(BaseModel):
     quantity: float = Field(gt=0)
     unit: str = Field(min_length=1, max_length=20)
     vault_id: int | None = Field(default=None, gt=0)
+    secrecy_level: Literal["internal", "confidential", "restricted", "top_secret"] = "internal"
+    retention_until: str | None = Field(default=None, min_length=10, max_length=40)
 
 
 class CopyIssueChild(BaseModel):

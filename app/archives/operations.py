@@ -9,7 +9,7 @@ from typing import Any
 from app.core.clock import Clock, SystemClock, to_storage
 from app.core.errors import ConflictError, NotFoundError, ValidationError
 from app.core.security import Principal
-from app.archives.repository import ApprovalRepository, VaultRepository, DossierRepository
+from app.archives.repository import ApprovalRepository, LegalHoldRepository, VaultRepository, DossierRepository, auto_pause_plans
 from app.services.audit import AuditService
 
 
@@ -92,6 +92,14 @@ class TransferService:
         if cursor.rowcount != 1:
             raise ConflictError("档案位置或版本已变化")
         after = self.dossiers.get(dossier_id)
+        auto_pause_plans(
+            self.connection,
+            dossier_id,
+            "dossier_version_changed",
+            now,
+            actor_user_id=principal.user_id,
+            details={"trigger": "vault.transferred"},
+        )
         self.dossiers.append_event(
             dossier_id,
             "vault.transferred",
@@ -122,7 +130,34 @@ class DisposalService:
         self.clock = clock or SystemClock()
         self.dossiers = DossierRepository(connection)
         self.approvals = ApprovalRepository(connection)
+        self.holds = LegalHoldRepository(connection)
         self.audit = AuditService(connection, self.clock)
+
+    @staticmethod
+    def certificate_digest(
+        request_id: int,
+        dossier_id: int,
+        quantity: float,
+        method: str,
+        witness_one: int,
+        witness_two: int,
+        disposed_at: str,
+    ) -> str:
+        """合规处置证明摘要，执行后核对时按同一规则重算。"""
+        return hashlib.sha256(
+            json.dumps(
+                {
+                    "request_id": request_id,
+                    "dossier_id": dossier_id,
+                    "quantity": quantity,
+                    "method": method,
+                    "witnesses": sorted([witness_one, witness_two]),
+                    "disposed_at": disposed_at,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
 
     def execute(self, principal: Principal, request_id: int, data: dict[str, Any]) -> dict[str, Any]:
         principal.require("dossiers.dispose")
@@ -141,6 +176,12 @@ class DisposalService:
         if existing:
             return {"record": dict(existing), "dossier": self.dossiers.get(approval["resource_id"]), "replayed": True}
         dossier = self.dossiers.get(approval["resource_id"])
+        active_holds = self.holds.active_for_dossier(dossier["id"])
+        if active_holds:
+            raise ConflictError(
+                "档案处于法律保全状态，禁止处置",
+                context={"hold_codes": [hold["hold_code"] for hold in active_holds]},
+            )
         quantity = float(approval["payload"].get("quantity", dossier["quantity"]))
         if quantity <= 0 or quantity > dossier["quantity"] - dossier["reserved_quantity"]:
             raise ConflictError("审批数量超过当前可合规处置数量")
@@ -149,20 +190,15 @@ class DisposalService:
         updated = self.dossiers.change_quantity(dossier["id"], -quantity, dossier["version"], now)
         target_state = "disposed" if remaining == 0 else "partially_disclosed"
         updated = self.dossiers.set_state(dossier["id"], target_state, updated["version"], now)
-        certificate = hashlib.sha256(
-            json.dumps(
-                {
-                    "request_id": request_id,
-                    "dossier_id": dossier["id"],
-                    "quantity": quantity,
-                    "method": data["method"],
-                    "witnesses": sorted([data["witness_one"], data["witness_two"]]),
-                    "disposed_at": now,
-                },
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("utf-8")
-        ).hexdigest()
+        certificate = self.certificate_digest(
+            request_id,
+            dossier["id"],
+            quantity,
+            data["method"],
+            data["witness_one"],
+            data["witness_two"],
+            now,
+        )
         cursor = self.connection.execute(
             """INSERT INTO disposal_records(
                    dossier_id,request_id,method,witness_one,witness_two,disposed_quantity,

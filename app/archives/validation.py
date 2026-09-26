@@ -43,6 +43,17 @@ def parse_timestamp(value: str, field: str = "时间") -> datetime:
     return parsed
 
 
+def require_iso_moment(value: str, field: str) -> str:
+    """接受 ISO-8601 日期或日期时间，统一规范化为带时区的存储字符串。"""
+    from app.core.clock import to_storage
+
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (TypeError, ValueError) as exc:
+        raise ValidationError(f"{field}不是有效的 ISO-8601 日期或时间") from exc
+    return to_storage(parsed)
+
+
 def validate_window(start: str, end: str, *, fields: tuple[str, str] = ("开始时间", "结束时间")) -> tuple[datetime, datetime]:
     """校验包含端点的档案授权时间窗口。"""
     first = parse_timestamp(start, fields[0])
